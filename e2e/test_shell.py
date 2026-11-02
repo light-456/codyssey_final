@@ -404,6 +404,65 @@ with sync_playwright() as p:
     check("음성 목록이 늦게 도착: 처음엔 단정 안 함 → 영어 음성이 없다고 드러나면 '듣기 불가'로 갱신", "안 돼요" not in first and "'듣기'(음성 재생)가 안 돼요" in later, first + " => " + later)
     ctx.close()
 
+    # --- getVoices() 를 부를 때마다 voiceschanged 를 다시 보내는 엔진(Android Chrome 보고 사례)에서도 다시 그리기가 돌지 않는다 ---
+    # 예전에는 알림마다 render() → 화면이 초당 30번 가까이 갈아 끼워져 깜빡이고, 누르던 단추가 바뀌어 탭이 먹히지 않았다.
+    ctx = b.new_context(viewport={"width": 390, "height": 844}, has_touch=True, is_mobile=True)
+    ctx.add_init_script("""(() => { const ss = window.speechSynthesis; if (!ss) return; const g = ss.getVoices.bind(ss);
+      ss.getVoices = function () { setTimeout(() => ss.dispatchEvent(new Event('voiceschanged')), 30); return g(); }; })();""")
+    page = ctx.new_page(); page.on("pageerror", lambda e: errors.append(str(e)))
+    page.goto(BASE + "/?demo=1"); page.wait_for_timeout(800)
+    page.evaluate("navFromMenu('u-coll')")
+    page.evaluate("(() => { window.__r = 0; const o = window.render; window.render = function () { window.__r++; return o.apply(this, arguments); }; })()")
+    page.wait_for_timeout(2000)
+    loops = page.evaluate("window.__r")
+    check("voiceschanged 가 반복돼도 2초 동안 다시 그리기 2회 이하(깜빡임 루프 없음)", loops <= 2, f"render {loops}회")
+    try:
+        page.locator('.pnav [data-id="u-sched"]').tap(timeout=3000); page.wait_for_timeout(400)
+        landed = page.evaluate("S.screen")
+    except Exception as e:
+        landed = "tap failed"
+    check("voiceschanged 가 반복되는 중에도 하단 탭이 눌린다", landed == "u-sched", landed)
+    ctx.close()
+
+    # --- 상황별 연습 도중 새로고침해도 날짜별 학습 진도가 남는다 (연습이 S.card 를 빌려 쓰므로 저장이 덮어쓰던 결함) ---
+    ctx = b.new_context(viewport={"width": 390, "height": 844})
+    page = ctx.new_page(); page.on("pageerror", lambda e: errors.append(str(e)))
+    page.goto(BASE + "/?demo=1"); page.wait_for_timeout(800)
+    page.evaluate("navFromMenu('u-study')"); page.wait_for_timeout(300)
+    page.evaluate("S.modal && ACT['modal-ok']()"); page.wait_for_timeout(200)
+    page.locator(".flip").first.click(); page.wait_for_timeout(120)
+    page.evaluate("ACT['card-next']()"); page.wait_for_timeout(120)
+    page.locator(".flip").first.click(); page.wait_for_timeout(120)
+    made = page.evaluate("({ i: S.card.i, n: S.card.flipped.size })")
+    check("진도 준비: 카드 2번째, 뒤집은 카드 2장", made == {"i": 1, "n": 2}, str(made))
+    page.evaluate("navFromMenu('u-coll')"); page.wait_for_timeout(300)
+    page.locator('[data-act="drill"][data-v="airport"]').click(); page.wait_for_timeout(300)
+    page.evaluate("ACT['card-next']()"); page.wait_for_timeout(150)
+    page.reload(); page.wait_for_timeout(3000)
+    check("연습 도중 새로고침: 문장 모음으로 돌아오고 연습은 끝남", page.evaluate("S.screen") == "u-coll" and page.evaluate("S.drill") is None, page.evaluate("S.screen"))
+    page.evaluate("navFromMenu('u-study')"); page.wait_for_timeout(300)
+    page.evaluate("S.modal && ACT['modal-ok']()"); page.wait_for_timeout(200)
+    back = page.evaluate("({ i: S.card.i, n: S.card.flipped.size })")
+    check("연습 도중 새로고침해도 날짜별 학습 진도(2번째 카드·뒤집은 2장)가 남음", back == made, str(back))
+    ctx.close()
+
+    # --- 카드를 보다가 홈에서 새로고침해도 학습 위치가 남는다 (새로고침 직후 도착한 AI 문장이 buildPlan 으로 카드를 지우던 결함) ---
+    ctx = b.new_context(viewport={"width": 390, "height": 844})
+    page = ctx.new_page(); page.on("pageerror", lambda e: errors.append(str(e)))
+    page.goto(BASE + "/?demo=1"); page.wait_for_timeout(800)
+    page.evaluate("navFromMenu('u-study')"); page.wait_for_timeout(300)
+    page.evaluate("S.modal && ACT['modal-ok']()"); page.wait_for_timeout(200)
+    page.locator(".flip").first.click(); page.wait_for_timeout(120)
+    page.evaluate("ACT['card-next']()"); page.wait_for_timeout(120)
+    made2 = page.evaluate("({ i: S.card.i, n: S.card.flipped.size })")
+    page.evaluate("navFromMenu('u-home')"); page.wait_for_timeout(300)
+    page.reload(); page.wait_for_timeout(3000)
+    page.evaluate("navFromMenu('u-study')"); page.wait_for_timeout(300)
+    page.evaluate("S.modal && ACT['modal-ok']()"); page.wait_for_timeout(200)
+    back2 = page.evaluate("({ i: S.card.i, n: S.card.flipped.size })")
+    check("카드를 보다 홈에서 새로고침해도 학습 위치(카드·뒤집은 수)가 남음", back2 == made2 and made2["n"] == 1, f"{made2} -> {back2}")
+    ctx.close()
+
     # --- 실제 터치 제스처 주입(CDP): 한 번 밀면 카드 한 장 (c76335a 같은 스와이프 회귀를 잡는다) ---
     # has_touch=True 만으로는 제스처가 발생하지 않는다. Input.dispatchTouchEvent 로 touchStart→move→End 를 직접 보낸다.
     def swipe(page, cdp, dx, steps=6):
